@@ -72,12 +72,12 @@ RCT_EXPORT_MODULE()
 // Singletone implementation based on https://stackoverflow.com/q/5720029/3686678 and https://stackoverflow.com/a/7035136/3686678
 +(instancetype) sharedInstance
 {
-    static RNVoipPushNotificationManager *sharedVoipPushManager = nil;
+    static RNCallKeep *sharedRNCallKeep = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        sharedVoipPushManager = [[self alloc] initPrivate];
+        sharedRNCallKeep = [[self alloc] initPrivate];
     });
-    return sharedVoipPushManager;
+    return sharedRNCallKeep;
 }
 
 - (void)dealloc
