@@ -121,7 +121,8 @@ RCT_EXPORT_MODULE()
 }
 
 - (void)sendEventWithNameWrapper:(NSString *)name body:(id)body {
-    if (_hasListeners) {
+    // Force sendEventWithName due to singleton on RN
+    if (true || _hasListeners) {
         [self sendEventWithName:name body:body];
     } else {
         NSDictionary *dictionary = [NSDictionary dictionaryWithObjectsAndKeys:
