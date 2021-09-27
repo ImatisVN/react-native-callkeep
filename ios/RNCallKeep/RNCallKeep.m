@@ -52,15 +52,10 @@ static CXProvider* sharedProvider;
 // should initialise in AppDelegate.m
 RCT_EXPORT_MODULE()
 
-- (instancetype) init
-{
-    return [[self class] sharedInstance];
-}
-
-- (instancetype)initPrivate
+- (instancetype)init
 {
 #ifdef DEBUG
-    NSLog(@"[RNCallKeep][initPrivate]");
+    NSLog(@"[RNCallKeep][init]");
 #endif
     if (self = [super init]) {
         _isStartCallActionEventListenerAdded = NO;
@@ -69,15 +64,13 @@ RCT_EXPORT_MODULE()
     return self;
 }
 
-// Singletone implementation based on https://stackoverflow.com/q/5720029/3686678 and https://stackoverflow.com/a/7035136/3686678
-+(instancetype) sharedInstance
-{
-    static RNCallKeep *sharedRNCallKeep = nil;
++ (id)allocWithZone:(NSZone *)zone {
+    static RNCallKeep *sharedInstance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        sharedRNCallKeep = [[self alloc] initPrivate];
+        sharedInstance = [super allocWithZone:zone];
     });
-    return sharedRNCallKeep;
+    return sharedInstance;
 }
 
 - (void)dealloc
@@ -122,6 +115,11 @@ RCT_EXPORT_MODULE()
     }
 }
 
+- (void)stopObserving
+{
+    _hasListeners = FALSE;
+}
+
 - (void)sendEventWithNameWrapper:(NSString *)name body:(id)body {
     if (_hasListeners) {
         [self sendEventWithName:name body:body];
@@ -143,13 +141,13 @@ RCT_EXPORT_MODULE()
 }
 
 + (void)setup:(NSDictionary *)options {
-    RNCallKeep *callKeep = [RNCallKeep sharedInstance];
+    RNCallKeep *callKeep = [RNCallKeep allocWithZone: nil];
     [callKeep setup:options];
     isSetupNatively = YES;
 }
 
 + (void)setup:(NSDictionary *)options callRejectHandler: (void (^) (NSString* uuid, void (^completion)(void))) onReject {
-    RNCallKeep *callKeep = [RNCallKeep sharedInstance];
+    RNCallKeep *callKeep = [RNCallKeep allocWithZone: nil];
     [callKeep setup:options];
     isSetupNatively = YES;
 
@@ -673,7 +671,7 @@ RCT_EXPORT_METHOD(getAudioRoutes: (RCTPromiseResolveBlock)resolve
     [_answeredCalls setValue:NO forKey:uuidString];
 
     [sharedProvider reportNewIncomingCallWithUUID:uuid update:callUpdate completion:^(NSError * _Nullable error) {
-        RNCallKeep *callKeep = [RNCallKeep sharedInstance];
+        RNCallKeep *callKeep = [RNCallKeep allocWithZone: nil];
         [callKeep sendEventWithNameWrapper:RNCallKeepDidDisplayIncomingCall body:@{
             @"error": error && error.localizedDescription ? error.localizedDescription : @"",
             @"callUUID": uuidString,
@@ -863,7 +861,7 @@ continueUserActivity:(NSUserActivity *)userActivity
             @"video": @(isVideoCall)
         };
 
-        RNCallKeep *callKeep = [RNCallKeep sharedInstance];
+        RNCallKeep *callKeep = [RNCallKeep allocWithZone: nil];
         [callKeep sendEventWithNameWrapper:RNCallKeepDidReceiveStartCallAction body:userInfo];
         return YES;
     }
