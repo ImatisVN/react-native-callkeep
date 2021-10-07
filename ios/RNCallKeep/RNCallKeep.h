@@ -19,6 +19,32 @@
 @property (nonatomic, strong) CXCallController *callKeepCallController;
 @property (nonatomic, strong) CXProvider *callKeepProvider;
 
+extern NSString * const RNCallKeepHandleStartCallNotification;
+
+extern NSString * const RNCallKeepDidReceiveStartCallAction;
+
+extern NSString * const RNCallKeepPerformAnswerCallAction;
+
+extern NSString * const RNCallKeepPerformEndCallAction;
+
+extern NSString * const RNCallKeepDidActivateAudioSession;
+
+extern NSString * const RNCallKeepDidDeactivateAudioSession;
+
+extern NSString * const RNCallKeepDidDisplayIncomingCall;
+
+extern NSString * const RNCallKeepDidPerformSetMutedCallAction;
+
+extern NSString * const RNCallKeepPerformPlayDTMFCallAction;
+
+extern NSString * const RNCallKeepDidToggleHoldAction;
+
+extern NSString * const RNCallKeepProviderReset;
+
+extern NSString * const RNCallKeepCheckReachability;
+
+extern NSString * const RNCallKeepDidLoadWithEvents;
+
 + (BOOL)application:(UIApplication *)application
             openURL:(NSURL *)url
             options:(NSDictionary<UIApplicationOpenURLOptionsKey, id> *)options NS_AVAILABLE_IOS(9_0);
@@ -48,5 +74,7 @@ continueUserActivity:(NSUserActivity *)userActivity
 + (void)setup:(NSDictionary *)options;
 
 + (void)setup:(NSDictionary *)options callRejectHandler: (void (^) (NSString* uuid, void (^completion)(void))) onReject;
+
+-(void) initCallKitProvider: (NSDictionary *) settings withEventHandler: (void (^) (NSString * eventName, id data)) onEvent;
 
 @end

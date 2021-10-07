@@ -22,27 +22,29 @@ static int const OUTGOING_CALL_WAKEUP_DELAY = 10;
 static int const OUTGOING_CALL_WAKEUP_DELAY = 5;
 #endif
 
-static NSString *const RNCallKeepHandleStartCallNotification = @"RNCallKeepHandleStartCallNotification";
-static NSString *const RNCallKeepDidReceiveStartCallAction = @"RNCallKeepDidReceiveStartCallAction";
-static NSString *const RNCallKeepPerformAnswerCallAction = @"RNCallKeepPerformAnswerCallAction";
-static NSString *const RNCallKeepPerformEndCallAction = @"RNCallKeepPerformEndCallAction";
-static NSString *const RNCallKeepDidActivateAudioSession = @"RNCallKeepDidActivateAudioSession";
-static NSString *const RNCallKeepDidDeactivateAudioSession = @"RNCallKeepDidDeactivateAudioSession";
-static NSString *const RNCallKeepDidDisplayIncomingCall = @"RNCallKeepDidDisplayIncomingCall";
-static NSString *const RNCallKeepDidPerformSetMutedCallAction = @"RNCallKeepDidPerformSetMutedCallAction";
-static NSString *const RNCallKeepPerformPlayDTMFCallAction = @"RNCallKeepDidPerformDTMFAction";
-static NSString *const RNCallKeepDidToggleHoldAction = @"RNCallKeepDidToggleHoldAction";
-static NSString *const RNCallKeepProviderReset = @"RNCallKeepProviderReset";
-static NSString *const RNCallKeepCheckReachability = @"RNCallKeepCheckReachability";
-static NSString *const RNCallKeepDidLoadWithEvents = @"RNCallKeepDidLoadWithEvents";
-
 @implementation RNCallKeep
 {
     NSOperatingSystemVersion _version;
     BOOL _isStartCallActionEventListenerAdded;
     bool _hasListeners;
     NSMutableArray *_delayedEvents;
-} 
+    
+    void (^onEventHandler) (NSString * eventName, id data);
+}
+
+NSString *const RNCallKeepHandleStartCallNotification = @"RNCallKeepHandleStartCallNotification";
+NSString *const RNCallKeepDidReceiveStartCallAction = @"RNCallKeepDidReceiveStartCallAction";
+ NSString *const RNCallKeepPerformAnswerCallAction = @"RNCallKeepPerformAnswerCallAction";
+ NSString *const RNCallKeepPerformEndCallAction = @"RNCallKeepPerformEndCallAction";
+ NSString *const RNCallKeepDidActivateAudioSession = @"RNCallKeepDidActivateAudioSession";
+ NSString *const RNCallKeepDidDeactivateAudioSession = @"RNCallKeepDidDeactivateAudioSession";
+ NSString *const RNCallKeepDidDisplayIncomingCall = @"RNCallKeepDidDisplayIncomingCall";
+ NSString *const RNCallKeepDidPerformSetMutedCallAction = @"RNCallKeepDidPerformSetMutedCallAction";
+ NSString *const RNCallKeepPerformPlayDTMFCallAction = @"RNCallKeepDidPerformDTMFAction";
+ NSString *const RNCallKeepDidToggleHoldAction = @"RNCallKeepDidToggleHoldAction";
+ NSString *const RNCallKeepProviderReset = @"RNCallKeepProviderReset";
+ NSString *const RNCallKeepCheckReachability = @"RNCallKeepCheckReachability";
+ NSString *const RNCallKeepDidLoadWithEvents = @"RNCallKeepDidLoadWithEvents";
 
 NSMutableDictionary *_answeredCalls;
 void (^onRejectHandler) (NSString* uuid, void (^completion)(void));
@@ -121,6 +123,10 @@ RCT_EXPORT_MODULE()
 }
 
 - (void)sendEventWithNameWrapper:(NSString *)name body:(id)body {
+    if (onEventHandler != nil) {
+        onEventHandler(name, body);
+    }
+    
     // Force sendEventWithName due to singleton on RN
     if (true || _hasListeners) {
         [self sendEventWithName:name body:body];
@@ -139,6 +145,64 @@ RCT_EXPORT_MODULE()
         NSDictionary *settings = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"RNCallKeepSettings"];
         sharedProvider = [[CXProvider alloc] initWithConfiguration:[RNCallKeep getProviderConfiguration:settings]];
     }
+}
+
+-(void) initCallKitProvider: (NSDictionary *) settings withEventHandler: (void (^) (NSString *, id)) onEvent {
+
+  _version = [[[NSProcessInfo alloc] init] operatingSystemVersion];
+
+
+
+  if (self.callKeepCallController == nil) {
+
+    self.callKeepCallController = [[CXCallController alloc] init];
+
+  }
+
+
+
+  BOOL renewConfiguration = true;
+
+
+
+  if (settings == nil) {
+
+    // fallback, get the previous saved settings
+
+    settings = [[NSUserDefaults standardUserDefaults] dictionaryForKey: @"RNCallKeepSettings"];
+
+    renewConfiguration = false;
+
+  } else {
+
+    // Store settings in NSUserDefault
+
+    [[NSUserDefaults standardUserDefaults] setObject: settings forKey: @"RNCallKeepSettings"];
+
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
+  }
+
+
+
+  if (renewConfiguration == true || sharedProvider == nil) {
+
+    sharedProvider = [[CXProvider alloc] initWithConfiguration: [RNCallKeep getProviderConfiguration: settings ]];
+
+  }
+
+
+
+  if (onEvent != nil) {
+
+    onEventHandler = onEvent;
+
+  }
+
+  self.callKeepProvider = sharedProvider;
+
+  [self.callKeepProvider setDelegate: self queue: nil];
+
 }
 
 + (void)setup:(NSDictionary *)options {
