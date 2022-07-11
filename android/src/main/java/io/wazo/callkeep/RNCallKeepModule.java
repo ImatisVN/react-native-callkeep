@@ -24,6 +24,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
@@ -59,6 +60,8 @@ import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.WritableNativeArray;
+import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.HeadlessJsTaskService;
 import com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter;
 import com.facebook.react.modules.permissions.PermissionsModule;
@@ -71,11 +74,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.ResourceBundle;
 
+import org.json.JSONObject;
+import org.json.JSONException;
+
 import static androidx.core.app.ActivityCompat.requestPermissions;
 
 import static io.wazo.callkeep.Constants.EXTRA_CALLER_NAME;
 import static io.wazo.callkeep.Constants.EXTRA_CALL_UUID;
 import static io.wazo.callkeep.Constants.EXTRA_CALL_NUMBER;
+import static io.wazo.callkeep.Constants.EXTRA_HAS_VIDEO;
 import static io.wazo.callkeep.Constants.ACTION_END_CALL;
 import static io.wazo.callkeep.Constants.ACTION_ANSWER_CALL;
 import static io.wazo.callkeep.Constants.ACTION_MUTE_CALL;
@@ -89,11 +96,15 @@ import static io.wazo.callkeep.Constants.ACTION_CHECK_REACHABILITY;
 import static io.wazo.callkeep.Constants.ACTION_WAKE_APP;
 import static io.wazo.callkeep.Constants.ACTION_SHOW_INCOMING_CALL_UI;
 import static io.wazo.callkeep.Constants.ACTION_ON_SILENCE_INCOMING_CALL;
+import static io.wazo.callkeep.Constants.ACTION_ON_CREATE_CONNECTION_FAILED;
+import static io.wazo.callkeep.Constants.ACTION_DID_CHANGE_AUDIO_ROUTE;
 
 // @see https://github.com/kbagchiGWC/voice-quickstart-android/blob/9a2aff7fbe0d0a5ae9457b48e9ad408740dfb968/exampleConnectionService/src/main/java/com/twilio/voice/examples/connectionservice/VoiceConnectionServiceActivity.java
 public class RNCallKeepModule extends ReactContextBaseJavaModule {
     public static final int REQUEST_READ_PHONE_STATE = 1337;
     public static final int REQUEST_REGISTER_CALL_PROVIDER = 394859;
+
+    public static RNCallKeepModule instance = null;
 
     private static final String E_ACTIVITY_DOES_NOT_EXIST = "E_ACTIVITY_DOES_NOT_EXIST";
     private static final String REACT_NATIVE_MODULE_NAME = "RNCallKeep";
@@ -111,19 +122,43 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     public static PhoneAccountHandle handle;
     private boolean isReceiverRegistered = false;
     private VoiceBroadcastReceiver voiceBroadcastReceiver;
-    private ReadableMap _settings;
+    private static WritableMap _settings;
+    private WritableNativeArray delayedEvents;
+    private boolean hasListeners = false;
 
-    public RNCallKeepModule(ReactApplicationContext reactContext) {
+    public static RNCallKeepModule getInstance(ReactApplicationContext reactContext, boolean realContext) {
+        if (instance == null) {
+            Log.d(TAG, "[RNCallKeepModule] getInstance : " + (reactContext == null ? "null" : "ok"));
+            instance = new RNCallKeepModule(reactContext);
+        }
+        if (realContext) {
+            instance.setContext(reactContext);
+        }
+        return instance;
+    }
+
+    public static WritableMap getSettings(@Nullable Context context) {
+        if (_settings == null) {
+            fetchStoredSettings(context);
+        }
+
+        return _settings;
+    }
+
+    private RNCallKeepModule(ReactApplicationContext reactContext) {
         super(reactContext);
-        Log.d(TAG, "[VoiceConnection] constructor");
+        Log.d(TAG, "[RNCallKeepModule] constructor");
 
         this.reactContext = reactContext;
+        delayedEvents = new WritableNativeArray();
+        this.registerReceiver();
+        this.fetchStoredSettings(reactContext);
     }
 
     private boolean isSelfManaged() {
-        try { 
+        try {
             return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && _settings.hasKey("selfManaged") && _settings.getBoolean("selfManaged");
-        } catch(Exception e) {
+        } catch (Exception e) {
             return false;
         }
     }
@@ -133,71 +168,157 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         return REACT_NATIVE_MODULE_NAME;
     }
 
+    public void setContext(ReactApplicationContext reactContext) {
+        Log.d(TAG, "[RNCallKeepModule] updating react context");
+        this.reactContext = reactContext;
+    }
+
+    public ReactApplicationContext getContext() {
+        return this.reactContext;
+    }
+
+    public void reportNewIncomingCall(String uuid, String number, String callerName, boolean hasVideo, String payload) {
+        Log.d(TAG, "[RNCallKeepModule] reportNewIncomingCall, uuid: " + uuid + ", number: " + number + ", callerName: " + callerName);
+
+        this.displayIncomingCall(uuid, number, callerName, hasVideo);
+
+        // Send event to JS
+        WritableMap args = Arguments.createMap();
+        args.putString("handle", number);
+        args.putString("callUUID", uuid);
+        args.putString("name", callerName);
+        args.putString("hasVideo", String.valueOf(hasVideo));
+        if (payload != null) {
+            args.putString("payload", payload);
+        }
+        sendEventToJS("RNCallKeepDidDisplayIncomingCall", args);
+    }
+
+    public void startObserving() {
+        int count = delayedEvents.size();
+        Log.d(TAG, "[RNCallKeepModule] startObserving, event count: " + count);
+        if (count > 0) {
+            this.reactContext.getJSModule(RCTDeviceEventEmitter.class).emit("RNCallKeepDidLoadWithEvents", delayedEvents);
+            delayedEvents = new WritableNativeArray();
+        }
+    }
+
+    public void initializeTelecomManager() {
+        Context context = this.getAppContext();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][initializeTelecomManager] no react context found.");
+            return;
+        }
+        ComponentName cName = new ComponentName(context, VoiceConnectionService.class);
+        String appName = this.getApplicationName(context);
+
+        handle = new PhoneAccountHandle(cName, appName);
+        telecomManager = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
+    }
+
+    @ReactMethod
+    public void setSettings(ReadableMap options) {
+        Log.d(TAG, "[RNCallKeepModule] setSettings : " + options);
+        if (options == null) {
+            return;
+        }
+        _settings = storeSettings(options);
+    }
+
+    @ReactMethod
+    public void addListener(String eventName) {
+      // Keep: Required for RN built in Event Emitter Calls.
+    }
+
+    @ReactMethod
+    public void removeListeners(Integer count) {
+      // Keep: Required for RN built in Event Emitter Calls.
+    }
+
     @ReactMethod
     public void setup(ReadableMap options) {
-        Log.d(TAG, "[VoiceConnection] setup");
+        Log.d(TAG, "[RNCallKeepModule] setup : " + options);
+
         VoiceConnectionService.setAvailable(false);
         VoiceConnectionService.setInitialized(true);
-        this._settings = options;
+        this.setSettings(options);
 
         if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (isSelfManaged()) {
-                Log.d(TAG, "[VoiceConnection] API Version supports self managed, and is enabled in setup");
+                Log.d(TAG, "[RNCallKeepModule] API Version supports self managed, and is enabled in setup");
             }
             else {
-                Log.d(TAG, "[VoiceConnection] API Version supports self managed, but it is not enabled in setup");
+                Log.d(TAG, "[RNCallKeepModule] API Version supports self managed, but it is not enabled in setup");
             }
         }
 
         // If we're running in self managed mode we need fewer permissions.
         if(isSelfManaged()) {
-            Log.d(TAG, "[VoiceConnection] setup, adding RECORD_AUDIO in permissions in self managed");
+            Log.d(TAG, "[RNCallKeepModule] setup, adding RECORD_AUDIO in permissions in self managed");
             permissions = new String[]{ Manifest.permission.RECORD_AUDIO };
         }
 
         if (isConnectionServiceAvailable()) {
-            this.registerPhoneAccount();
+            this.registerPhoneAccount(options);
             this.registerEvents();
+            this.startObserving();
             VoiceConnectionService.setAvailable(true);
         }
-
-        VoiceConnectionService.setSettings(options);
     }
 
     @ReactMethod
-    public void registerPhoneAccount() {
+    public void registerPhoneAccount(ReadableMap options) {
+        setSettings(options);
+
         if (!isConnectionServiceAvailable()) {
-            Log.w(TAG, "[VoiceConnection] registerPhoneAccount ignored due to no ConnectionService");
+            Log.w(TAG, "[RNCallKeepModule] registerPhoneAccount ignored due to no ConnectionService");
             return;
         }
 
-        Log.d(TAG, "[VoiceConnection] registerPhoneAccount");
+        Log.d(TAG, "[RNCallKeepModule] registerPhoneAccount");
+        Context context = this.getAppContext();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][registerPhoneAccount] no react context found.");
+            return;
+        }
 
-        this.registerPhoneAccount(this.getAppContext());
+        this.registerPhoneAccount(context);
     }
 
     @ReactMethod
     public void registerEvents() {
         if (!isConnectionServiceAvailable()) {
-            Log.w(TAG, "[VoiceConnection] registerEvents ignored due to no ConnectionService");
+            Log.w(TAG, "[RNCallKeepModule] registerEvents ignored due to no ConnectionService");
             return;
         }
 
-        Log.d(TAG, "[VoiceConnection] registerEvents");
+        Log.d(TAG, "[RNCallKeepModule] registerEvents");
 
-        voiceBroadcastReceiver = new VoiceBroadcastReceiver();
-        registerReceiver();
+        this.hasListeners = true;
+        this.startObserving();
         VoiceConnectionService.setPhoneAccountHandle(handle);
     }
 
     @ReactMethod
+    public void unregisterEvents() {
+        Log.d(TAG, "[RNCallKeepModule] unregisterEvents");
+
+        this.hasListeners = false;
+    }
+
+    @ReactMethod
     public void displayIncomingCall(String uuid, String number, String callerName) {
+        this.displayIncomingCall(uuid, number, callerName, false);
+    }
+
+    @ReactMethod
+    public void displayIncomingCall(String uuid, String number, String callerName, boolean hasVideo) {
         if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
-            Log.w(TAG, "[VoiceConnection] displayIncomingCall ignored due to no ConnectionService or no phone account");
+            Log.w(TAG, "[RNCallKeepModule] displayIncomingCall ignored due to no ConnectionService or no phone account");
             return;
         }
 
-        Log.d(TAG, "[VoiceConnection] displayIncomingCall, uuid: " + uuid + ", number: " + number + ", callerName: " + callerName);
+        Log.d(TAG, "[RNCallKeepModule] displayIncomingCall, uuid: " + uuid + ", number: " + number + ", callerName: " + callerName + ", hasVideo: " + hasVideo);
 
         Bundle extras = new Bundle();
         Uri uri = Uri.fromParts(PhoneAccount.SCHEME_TEL, number, null);
@@ -205,21 +326,22 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         extras.putParcelable(TelecomManager.EXTRA_INCOMING_CALL_ADDRESS, uri);
         extras.putString(EXTRA_CALLER_NAME, callerName);
         extras.putString(EXTRA_CALL_UUID, uuid);
+        extras.putString(EXTRA_HAS_VIDEO, String.valueOf(hasVideo));
 
         telecomManager.addNewIncomingCall(handle, extras);
     }
 
     @ReactMethod
     public void answerIncomingCall(String uuid) {
-        Log.d(TAG, "[VoiceConnection] answerIncomingCall, uuid: " + uuid);
+        Log.d(TAG, "[RNCallKeepModule] answerIncomingCall, uuid: " + uuid);
         if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
-            Log.w(TAG, "[VoiceConnection] answerIncomingCall ignored due to no ConnectionService or no phone account");
+            Log.w(TAG, "[RNCallKeepModule] answerIncomingCall ignored due to no ConnectionService or no phone account");
             return;
         }
 
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] answerIncomingCall ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] answerIncomingCall ignored because no connection found, uuid: " + uuid);
             return;
         }
 
@@ -228,10 +350,15 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void startCall(String uuid, String number, String callerName) {
-        Log.d(TAG, "[VoiceConnection] startCall called, uuid: " + uuid + ", number: " + number + ", callerName: " + callerName);
+        this.startCall(uuid, number, callerName, false);
+    }
+
+    @ReactMethod
+    public void startCall(String uuid, String number, String callerName, boolean hasVideo) {
+        Log.d(TAG, "[RNCallKeepModule] startCall called, uuid: " + uuid + ", number: " + number + ", callerName: " + callerName);
 
         if (!isConnectionServiceAvailable() || !hasPhoneAccount() || !hasPermissions() || number == null) {
-            Log.w(TAG, "[VoiceConnection] startCall ignored: " + isConnectionServiceAvailable() + ", " + hasPhoneAccount() + ", " + hasPermissions() + ", " + number);
+            Log.w(TAG, "[RNCallKeepModule] startCall ignored: " + isConnectionServiceAvailable() + ", " + hasPhoneAccount() + ", " + hasPermissions() + ", " + number);
             return;
         }
 
@@ -242,63 +369,65 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         callExtras.putString(EXTRA_CALLER_NAME, callerName);
         callExtras.putString(EXTRA_CALL_UUID, uuid);
         callExtras.putString(EXTRA_CALL_NUMBER, number);
+        callExtras.putString(EXTRA_HAS_VIDEO, String.valueOf(hasVideo));
 
         extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle);
         extras.putParcelable(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, callExtras);
 
-        Log.d(TAG, "[VoiceConnection] startCall, uuid: " + uuid);
+        Log.d(TAG, "[RNCallKeepModule] startCall, uuid: " + uuid);
 
         telecomManager.placeCall(uri, extras);
     }
 
     @ReactMethod
     public void endCall(String uuid) {
-        Log.d(TAG, "[VoiceConnection] endCall called, uuid: " + uuid);
+        Log.d(TAG, "[RNCallKeepModule] endCall called, uuid: " + uuid);
         if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
-           Log.w(TAG, "[VoiceConnection] endCall ignored due to no ConnectionService or no phone account");
+           Log.w(TAG, "[RNCallKeepModule] endCall ignored due to no ConnectionService or no phone account");
             return;
         }
 
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] endCall ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] endCall ignored because no connection found, uuid: " + uuid);
             return;
         }
         conn.onDisconnect();
 
-        Log.d(TAG, "[VoiceConnection] endCall executed, uuid: " + uuid);
+        Log.d(TAG, "[RNCallKeepModule] endCall executed, uuid: " + uuid);
     }
 
     @ReactMethod
     public void endAllCalls() {
-        Log.d(TAG, "[VoiceConnection] endAllCalls called");
+        Log.d(TAG, "[RNCallKeepModule] endAllCalls called");
         if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
-            Log.w(TAG, "[VoiceConnection] endAllCalls ignored due to no ConnectionService or no phone account");
+            Log.w(TAG, "[RNCallKeepModule] endAllCalls ignored due to no ConnectionService or no phone account");
             return;
         }
 
-        Map<String, VoiceConnection> currentConnections = VoiceConnectionService.currentConnections;
-        for (Map.Entry<String, VoiceConnection> connectionEntry : currentConnections.entrySet()) {
+        ArrayList<Map.Entry<String, VoiceConnection>> connections =
+            new ArrayList<Map.Entry<String, VoiceConnection>>(VoiceConnectionService.currentConnections.entrySet());
+        for (Map.Entry<String, VoiceConnection> connectionEntry : connections) {
             Connection connectionToEnd = connectionEntry.getValue();
             connectionToEnd.onDisconnect();
         }
 
-        Log.d(TAG, "[VoiceConnection] endAllCalls executed");
+        Log.d(TAG, "[RNCallKeepModule] endAllCalls executed");
     }
 
     @ReactMethod
     public void checkPhoneAccountPermission(ReadableArray optionalPermissions, Promise promise) {
-        Activity currentActivity = this.getCurrentActivity();
+        Activity currentActivity = this.getCurrentReactActivity();
 
         if (!isConnectionServiceAvailable()) {
             String error = "ConnectionService not available for this version of Android.";
-            Log.w(TAG, "[VoiceConnection] checkPhoneAccountPermission error " + error);
+            Log.w(TAG, "[RNCallKeepModule] checkPhoneAccountPermission error " + error);
             promise.reject(E_ACTIVITY_DOES_NOT_EXIST, error);
             return;
         }
         if (currentActivity == null) {
             String error = "Activity doesn't exist";
-            Log.w(TAG, "[VoiceConnection] checkPhoneAccountPermission error " + error);
+            Log.w(TAG, "[RNCallKeepModule] checkPhoneAccountPermission error " + error);
             promise.reject(E_ACTIVITY_DOES_NOT_EXIST, error);
             return;
         }
@@ -409,12 +538,22 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void getInitialEvents(Promise promise) {
+        promise.resolve(delayedEvents);
+    }
+
+    @ReactMethod
+    public void clearInitialEvents() {
+        delayedEvents = new WritableNativeArray();
+    }
+
+    @ReactMethod
     public void setOnHold(String uuid, boolean shouldHold) {
-        Log.d(TAG, "[VoiceConnection] setOnHold, uuid: " + uuid + ", shouldHold: " + (shouldHold ? "true" : "false"));
+        Log.d(TAG, "[RNCallKeepModule] setOnHold, uuid: " + uuid + ", shouldHold: " + (shouldHold ? "true" : "false"));
 
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] setOnHold ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] setOnHold ignored because no connection found, uuid: " + uuid);
             return;
         }
 
@@ -427,14 +566,14 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void reportEndCallWithUUID(String uuid, int reason) {
-        Log.d(TAG, "[VoiceConnection] reportEndCallWithUUID, uuid: " + uuid + ", reason: " + reason);
+        Log.d(TAG, "[RNCallKeepModule] reportEndCallWithUUID, uuid: " + uuid + ", reason: " + reason);
         if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
             return;
         }
 
         VoiceConnection conn = (VoiceConnection) VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] reportEndCallWithUUID ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] reportEndCallWithUUID ignored because no connection found, uuid: " + uuid);
             return;
         }
         conn.reportDisconnect(reason);
@@ -442,15 +581,15 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void rejectCall(String uuid) {
-        Log.d(TAG, "[VoiceConnection] rejectCall, uuid: " + uuid);
+        Log.d(TAG, "[RNCallKeepModule] rejectCall, uuid: " + uuid);
         if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
-            Log.w(TAG, "[VoiceConnection] endAllCalls ignored due to no ConnectionService or no phone account");
+            Log.w(TAG, "[RNCallKeepModule] rejectCall ignored due to no ConnectionService or no phone account");
             return;
         }
 
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] rejectCall ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] rejectCall ignored because no connection found, uuid: " + uuid);
             return;
         }
 
@@ -458,11 +597,22 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
+    public void setConnectionState(String uuid, int state) {
+        Log.d(TAG, "[RNCallKeepModule] setConnectionState, uuid: " + uuid + ", state :" + state);
+        if (!isConnectionServiceAvailable() || !hasPhoneAccount()) {
+            Log.w(TAG, "[RNCallKeepModule] String ignored due to no ConnectionService or no phone account");
+            return;
+        }
+
+        VoiceConnectionService.setState(uuid, state);
+    }
+
+    @ReactMethod
     public void setMutedCall(String uuid, boolean shouldMute) {
-        Log.d(TAG, "[VoiceConnection] setMutedCall, uuid: " + uuid + ", shouldMute: " + (shouldMute ? "true" : "false"));
+        Log.d(TAG, "[RNCallKeepModule] setMutedCall, uuid: " + uuid + ", shouldMute: " + (shouldMute ? "true" : "false"));
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] setMutedCall ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] setMutedCall ignored because no connection found, uuid: " + uuid);
             return;
         }
 
@@ -484,10 +634,10 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
      */
     @ReactMethod
     public void toggleAudioRouteSpeaker(String uuid, boolean routeSpeaker) {
-        Log.d(TAG, "[VoiceConnection] toggleAudioRouteSpeaker, uuid: " + uuid + ", routeSpeaker: " + (routeSpeaker ? "true" : "false"));
+        Log.d(TAG, "[RNCallKeepModule] toggleAudioRouteSpeaker, uuid: " + uuid + ", routeSpeaker: " + (routeSpeaker ? "true" : "false"));
         VoiceConnection conn = (VoiceConnection) VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] toggleAudioRouteSpeaker ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] toggleAudioRouteSpeaker ignored because no connection found, uuid: " + uuid);
             return;
         }
         if (routeSpeaker) {
@@ -505,24 +655,24 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
                 return;
             }
             if(audioRoute.equals("Bluetooth")) {
-                Log.d(TAG,"[VoiceConnection] setting audio route: Bluetooth");
+                Log.d(TAG,"[RNCallKeepModule] setting audio route: Bluetooth");
                 conn.setAudioRoute(CallAudioState.ROUTE_BLUETOOTH);
                 promise.resolve(true);
                 return;
             }
             if(audioRoute.equals("Headset")) {
-                Log.d(TAG,"[VoiceConnection] setting audio route: Headset");
+                Log.d(TAG,"[RNCallKeepModule] setting audio route: Headset");
                 conn.setAudioRoute(CallAudioState.ROUTE_WIRED_HEADSET);
                 promise.resolve(true);
                 return;
             }
             if(audioRoute.equals("Speaker")) {
-                Log.d(TAG,"[VoiceConnection] setting audio route: Speaker");
+                Log.d(TAG,"[RNCallKeepModule] setting audio route: Speaker");
                 conn.setAudioRoute(CallAudioState.ROUTE_SPEAKER);
                 promise.resolve(true);
                 return;
             }
-            Log.d(TAG,"[VoiceConnection] setting audio route: Wired/Earpiece");
+            Log.d(TAG,"[RNCallKeepModule] setting audio route: Wired/Earpiece");
             conn.setAudioRoute(CallAudioState.ROUTE_WIRED_OR_EARPIECE);
             promise.resolve(true);
         } catch (Exception e) {
@@ -534,16 +684,25 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     public void getAudioRoutes(Promise promise){
         try {
             Context context = this.getAppContext();
+            if (context == null) {
+                Log.w(TAG, "[RNCallKeepModule][getAudioRoutes] no react context found.");
+                promise.reject("No react context found to list audio routes");
+                return;
+            }
             AudioManager audioManager = (AudioManager) context.getSystemService(context.AUDIO_SERVICE);
             WritableArray devices = Arguments.createArray();
             ArrayList<String> typeChecker = new ArrayList<>();
             AudioDeviceInfo[] audioDeviceInfo = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS + AudioManager.GET_DEVICES_OUTPUTS);
+            String selectedAudioRoute = getSelectedAudioRoute(audioManager);
             for (AudioDeviceInfo device : audioDeviceInfo){
                 String type = getAudioRouteType(device.getType());
                 if(type != null && !typeChecker.contains(type)) {
                     WritableMap deviceInfo = Arguments.createMap();
                     deviceInfo.putString("name",  type);
                     deviceInfo.putString("type",  type);
+                    if(type.equals(selectedAudioRoute)) {
+                        deviceInfo.putBoolean("selected",  true);
+                    }
                     typeChecker.add(type);
                     devices.pushMap(deviceInfo);
                 }
@@ -571,12 +730,25 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         }
     }
 
+    private String getSelectedAudioRoute(AudioManager audioManager){
+        if(audioManager.isBluetoothScoOn()){
+            return "Bluetooth";
+        }
+        if(audioManager.isSpeakerphoneOn()){
+            return "Speaker";
+        }
+        if(audioManager.isWiredHeadsetOn()){
+            return "Headset";
+        }
+        return "Phone";
+    }
+
     @ReactMethod
     public void sendDTMF(String uuid, String key) {
-        Log.d(TAG, "[VoiceConnection] sendDTMF, uuid: " + uuid + ", key: " + key);
+        Log.d(TAG, "[RNCallKeepModule] sendDTMF, uuid: " + uuid + ", key: " + key);
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] sendDTMF ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] sendDTMF ignored because no connection found, uuid: " + uuid);
             return;
         }
         char dtmf = key.charAt(0);
@@ -585,10 +757,10 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void updateDisplay(String uuid, String displayName, String uri) {
-        Log.d(TAG, "[VoiceConnection] updateDisplay, uuid: " + uuid + ", displayName: " + displayName+ ", uri: " + uri);
+        Log.d(TAG, "[RNCallKeepModule] updateDisplay, uuid: " + uuid + ", displayName: " + displayName+ ", uri: " + uri);
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] updateDisplay ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] updateDisplay ignored because no connection found, uuid: " + uuid);
             return;
         }
 
@@ -621,8 +793,18 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     }
 
     @ReactMethod
-    public void setForegroundServiceSettings(ReadableMap settings) {
-        VoiceConnectionService.setSettings(settings);
+    public void setForegroundServiceSettings(ReadableMap foregroundServerSettings) {
+        if (foregroundServerSettings == null) {
+            return;
+        }
+
+        // Retrieve settings and set the `foregroundService` value
+        WritableMap settings = getSettings(null);
+        if (settings != null) {
+            settings.putMap("foregroundService", MapUtils.readableToWritableMap(foregroundServerSettings));
+        }
+
+        setSettings(settings);
     }
 
     @ReactMethod
@@ -637,10 +819,10 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void setCurrentCallActive(String uuid) {
-        Log.d(TAG, "[VoiceConnection] setCurrentCallActive, uuid: " + uuid);
+        Log.d(TAG, "[RNCallKeepModule] setCurrentCallActive, uuid: " + uuid);
         Connection conn = VoiceConnectionService.getConnection(uuid);
         if (conn == null) {
-            Log.w(TAG, "[VoiceConnection] setCurrentCallActive ignored because no connection found, uuid: " + uuid);
+            Log.w(TAG, "[RNCallKeepModule] setCurrentCallActive ignored because no connection found, uuid: " + uuid);
             return;
         }
 
@@ -650,9 +832,9 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void openPhoneAccounts() {
-        Log.d(TAG, "[VoiceConnection] openPhoneAccounts");
+        Log.d(TAG, "[RNCallKeepModule] openPhoneAccounts");
         if (!isConnectionServiceAvailable()) {
-            Log.w(TAG, "[VoiceConnection] openPhoneAccounts ignored due to no ConnectionService");
+            Log.w(TAG, "[RNCallKeepModule] openPhoneAccounts ignored due to no ConnectionService");
             return;
         }
 
@@ -662,7 +844,13 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
             intent.setComponent(new ComponentName("com.android.server.telecom",
                     "com.android.server.telecom.settings.EnableAccountPreferenceActivity"));
 
-            this.getAppContext().startActivity(intent);
+            Context context = this.getAppContext();
+            if (context == null) {
+                Log.w(TAG, "[RNCallKeepModule][openPhoneAccounts] no react context found.");
+                return;
+            }
+
+            context.startActivity(intent);
             return;
         }
 
@@ -671,15 +859,20 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void openPhoneAccountSettings() {
-        Log.d(TAG, "[VoiceConnection] openPhoneAccountSettings");
+        Log.d(TAG, "[RNCallKeepModule] openPhoneAccountSettings");
         if (!isConnectionServiceAvailable()) {
-            Log.w(TAG, "[VoiceConnection] openPhoneAccountSettings ignored due to no ConnectionService");
+            Log.w(TAG, "[RNCallKeepModule] openPhoneAccountSettings ignored due to no ConnectionService");
             return;
         }
 
         Intent intent = new Intent(TelecomManager.ACTION_CHANGE_PHONE_ACCOUNTS);
         intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        this.getAppContext().startActivity(intent);
+        Context context = this.getAppContext();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][openPhoneAccountSettings] no react context found.");
+            return;
+        }
+        context.startActivity(intent);
     }
 
     public static Boolean isConnectionServiceAvailable() {
@@ -700,11 +893,15 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void backToForeground() {
         Context context = getAppContext();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][backToForeground] no react context found.");
+            return;
+        }
         String packageName = context.getApplicationContext().getPackageName();
         Intent focusIntent = context.getPackageManager().getLaunchIntentForPackage(packageName).cloneFilter();
-        Activity activity = getCurrentActivity();
+        Activity activity = getCurrentReactActivity();
         boolean isOpened = activity != null;
-        Log.d(TAG, "[VoiceConnection] backToForeground, app isOpened ?" + (isOpened ? "true" : "false"));
+        Log.d(TAG, "[RNCallKeepModule] backToForeground, app isOpened ?" + (isOpened ? "true" : "false"));
 
         if (isOpened) {
             focusIntent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
@@ -719,23 +916,36 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         }
     }
 
-    private void initializeTelecomManager() {
-        Context context = this.getAppContext();
-        ComponentName cName = new ComponentName(context, VoiceConnectionService.class);
-        String appName = this.getApplicationName(context);
+    public static void onRequestPermissionsResult(int requestCode, String[] grantedPermissions, int[] grantResults) {
+        int permissionsIndex = 0;
+        List<String> permsList = Arrays.asList(permissions);
+        for (int result : grantResults) {
+            if (permsList.contains(grantedPermissions[permissionsIndex]) && result != PackageManager.PERMISSION_GRANTED) {
+                hasPhoneAccountPromise.resolve(false);
+                return;
+            }
+            permissionsIndex++;
+        }
+        hasPhoneAccountPromise.resolve(true);
+    }
 
-        handle = new PhoneAccountHandle(cName, appName);
-        telecomManager = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
+    public Activity getCurrentReactActivity() {
+        return this.reactContext.getCurrentActivity();
     }
 
     private void registerPhoneAccount(Context appContext) {
         if (!isConnectionServiceAvailable()) {
-            Log.w(TAG, "[VoiceConnection] registerPhoneAccount ignored due to no ConnectionService");
+            Log.w(TAG, "[RNCallKeepModule] registerPhoneAccount ignored due to no ConnectionService");
             return;
         }
 
         this.initializeTelecomManager();
-        String appName = this.getApplicationName(this.getAppContext());
+        Context context = this.getAppContext();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][registerPhoneAccount] no react context found.");
+            return;
+        }
+        String appName = this.getApplicationName(context);
 
         PhoneAccount.Builder builder = new PhoneAccount.Builder(handle, appName);
         if (isSelfManaged()) {
@@ -753,14 +963,27 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
 
         PhoneAccount account = builder.build();
 
-        telephonyManager = (TelephonyManager) this.getAppContext().getSystemService(Context.TELEPHONY_SERVICE);
+        telephonyManager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
 
         telecomManager.registerPhoneAccount(account);
     }
 
     private void sendEventToJS(String eventName, @Nullable WritableMap params) {
-        Log.v(TAG, "[VoiceConnection] sendEventToJS, eventName :" + eventName + ", args : " + (params != null ? params.toString() : "null"));
-        this.reactContext.getJSModule(RCTDeviceEventEmitter.class).emit(eventName, params);
+        boolean isBoundToJS = this.reactContext.hasActiveCatalystInstance();
+        Log.v(TAG, "[RNCallKeepModule] sendEventToJS, eventName: " + eventName + ", bound: " + isBoundToJS + ", hasListeners: " + hasListeners + " args : " + (params != null ? params.toString() : "null"));
+
+        if (isBoundToJS && hasListeners) {
+            this.reactContext.getJSModule(RCTDeviceEventEmitter.class).emit(eventName, params);
+        } else {
+            WritableMap data = Arguments.createMap();
+            if (params == null) {
+                params = Arguments.createMap();
+            }
+
+            data.putString("name", eventName);
+            data.putMap("data", params);
+            delayedEvents.pushMap(data);
+        }
     }
 
     private String getApplicationName(Context appContext) {
@@ -771,15 +994,11 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
     }
 
     private Boolean hasPermissions() {
-        Activity currentActivity = this.getCurrentActivity();
-
-        if (currentActivity == null) {
-            return false;
-        }
+        ReactApplicationContext context = getContext();
 
         boolean hasPermissions = true;
         for (String permission : permissions) {
-            int permissionCheck = ContextCompat.checkSelfPermission(currentActivity, permission);
+            int permissionCheck = ContextCompat.checkSelfPermission(context, permission);
             if (permissionCheck != PackageManager.PERMISSION_GRANTED) {
                 hasPermissions = false;
             }
@@ -788,13 +1007,23 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
         return hasPermissions;
     }
 
-    private static boolean hasPhoneAccount() {
-        return isConnectionServiceAvailable() && telecomManager != null
-            && telecomManager.getPhoneAccount(handle) != null && telecomManager.getPhoneAccount(handle).isEnabled();
+    private boolean hasPhoneAccount() {
+        if (telecomManager == null) {
+            this.initializeTelecomManager();
+        }
+
+        if (isSelfManaged()) {
+            return true;
+        }
+
+        return isConnectionServiceAvailable() && telecomManager != null &&
+            hasPermissions() && telecomManager.getPhoneAccount(handle) != null &&
+            telecomManager.getPhoneAccount(handle).isEnabled();
     }
 
     private void registerReceiver() {
         if (!isReceiverRegistered) {
+            voiceBroadcastReceiver = new VoiceBroadcastReceiver();
             IntentFilter intentFilter = new IntentFilter();
             intentFilter.addAction(ACTION_END_CALL);
             intentFilter.addAction(ACTION_ANSWER_CALL);
@@ -808,27 +1037,63 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
             intentFilter.addAction(ACTION_CHECK_REACHABILITY);
             intentFilter.addAction(ACTION_SHOW_INCOMING_CALL_UI);
             intentFilter.addAction(ACTION_ON_SILENCE_INCOMING_CALL);
+            intentFilter.addAction(ACTION_ON_CREATE_CONNECTION_FAILED);
+            intentFilter.addAction(ACTION_DID_CHANGE_AUDIO_ROUTE);
 
-            LocalBroadcastManager.getInstance(this.reactContext).registerReceiver(voiceBroadcastReceiver, intentFilter);
-            isReceiverRegistered = true;
+            if (this.reactContext != null) {
+                LocalBroadcastManager.getInstance(this.reactContext).registerReceiver(voiceBroadcastReceiver, intentFilter);
+                isReceiverRegistered = true;
+
+                VoiceConnectionService.startObserving();
+            }
         }
     }
 
     private Context getAppContext() {
-        return this.reactContext.getApplicationContext();
+        return this.reactContext != null ? this.reactContext.getApplicationContext() : null;
     }
 
-    public static void onRequestPermissionsResult(int requestCode, String[] grantedPermissions, int[] grantResults) {
-        int permissionsIndex = 0;
-        List<String> permsList = Arrays.asList(permissions);
-        for (int result : grantResults) {
-            if (permsList.contains(grantedPermissions[permissionsIndex]) && result != PackageManager.PERMISSION_GRANTED) {
-                hasPhoneAccountPromise.resolve(false);
-                return;
-            }
-            permissionsIndex++;
+    // Store all callkeep settings in JSON
+    private WritableMap storeSettings(ReadableMap options) {
+        Context context = getAppContext();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][storeSettings] no react context found.");
+            return MapUtils.readableToWritableMap(options);
         }
-        hasPhoneAccountPromise.resolve(true);
+
+        SharedPreferences sharedPref = context.getSharedPreferences("rn-callkeep", Context.MODE_PRIVATE);
+        try {
+            JSONObject jsonObject = MapUtils.convertMapToJson(options);
+            String jsonString = jsonObject.toString();
+            sharedPref.edit().putString("settings", jsonString).apply();
+        } catch (JSONException e) {
+            Log.w(TAG, "[RNCallKeepModule][storeSettings] exception: " + e);
+        }
+        return MapUtils.readableToWritableMap(options);
+    }
+
+    private static void fetchStoredSettings(@Nullable Context fromContext) {
+        Context context = fromContext != null ? fromContext : instance.getAppContext();
+        if (instance == null && context == null) {
+            Log.w(TAG, "[RNCallKeepModule][fetchStoredSettings] no instance nor fromContext.");
+            return;
+        }
+        _settings = new WritableNativeMap();
+        if (context == null) {
+            Log.w(TAG, "[RNCallKeepModule][fetchStoredSettings] no react context found.");
+            return;
+        }
+
+        SharedPreferences sharedPref = context.getSharedPreferences("rn-callkeep", Context.MODE_PRIVATE);
+        try {
+            String jsonString = sharedPref.getString("settings", (new JSONObject()).toString());
+            if (jsonString != null) {
+                JSONObject jsonObject = new JSONObject(jsonString);
+
+                _settings = MapUtils.convertJsonToMap(jsonObject);
+            }
+        } catch(JSONException e) {
+        }
     }
 
     private class VoiceBroadcastReceiver extends BroadcastReceiver {
@@ -837,6 +1102,8 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
             WritableMap args = Arguments.createMap();
             HashMap<String, String> attributeMap = (HashMap<String, String>)intent.getSerializableExtra("attributeMap");
 
+            Log.d(TAG, "[RNCallKeepModule][onReceive] " + intent.getAction());
+
             switch (intent.getAction()) {
                 case ACTION_END_CALL:
                     args.putString("callUUID", attributeMap.get(EXTRA_CALL_UUID));
@@ -844,6 +1111,7 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
                     break;
                 case ACTION_ANSWER_CALL:
                     args.putString("callUUID", attributeMap.get(EXTRA_CALL_UUID));
+                    args.putBoolean("withVideo", Boolean.valueOf(attributeMap.get(EXTRA_HAS_VIDEO)));
                     sendEventToJS("RNCallKeepPerformAnswerCallAction", args);
                     break;
                 case ACTION_HOLD_CALL:
@@ -887,6 +1155,7 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
                     args.putString("handle", attributeMap.get(EXTRA_CALL_NUMBER));
                     args.putString("callUUID", attributeMap.get(EXTRA_CALL_UUID));
                     args.putString("name", attributeMap.get(EXTRA_CALLER_NAME));
+                    args.putString("hasVideo", attributeMap.get(EXTRA_HAS_VIDEO));
                     sendEventToJS("RNCallKeepShowIncomingCallUi", args);
                     break;
                 case ACTION_WAKE_APP:
@@ -894,7 +1163,7 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
                     headlessIntent.putExtra("callUUID", attributeMap.get(EXTRA_CALL_UUID));
                     headlessIntent.putExtra("name", attributeMap.get(EXTRA_CALLER_NAME));
                     headlessIntent.putExtra("handle", attributeMap.get(EXTRA_CALL_NUMBER));
-                    Log.d(TAG, "[VoiceConnection] wakeUpApplication: " + attributeMap.get(EXTRA_CALL_UUID) + ", number : " + attributeMap.get(EXTRA_CALL_NUMBER) + ", displayName:" + attributeMap.get(EXTRA_CALLER_NAME));
+                    Log.d(TAG, "[RNCallKeepModule] wakeUpApplication: " + attributeMap.get(EXTRA_CALL_UUID) + ", number : " + attributeMap.get(EXTRA_CALL_NUMBER) + ", displayName:" + attributeMap.get(EXTRA_CALLER_NAME));
 
                     ComponentName name = reactContext.startService(headlessIntent);
                     if (name != null) {
@@ -906,6 +1175,18 @@ public class RNCallKeepModule extends ReactContextBaseJavaModule {
                     args.putString("callUUID", attributeMap.get(EXTRA_CALL_UUID));
                     args.putString("name", attributeMap.get(EXTRA_CALLER_NAME));
                     sendEventToJS("RNCallKeepOnSilenceIncomingCall", args);
+                    break;
+                case ACTION_ON_CREATE_CONNECTION_FAILED:
+                    args.putString("handle", attributeMap.get(EXTRA_CALL_NUMBER));
+                    args.putString("callUUID", attributeMap.get(EXTRA_CALL_UUID));
+                    args.putString("name", attributeMap.get(EXTRA_CALLER_NAME));
+                    sendEventToJS("RNCallKeepOnIncomingConnectionFailed", args);
+                    break;
+                case ACTION_DID_CHANGE_AUDIO_ROUTE:
+                    args.putString("handle", attributeMap.get(EXTRA_CALL_NUMBER));
+                    args.putString("callUUID", attributeMap.get(EXTRA_CALL_UUID));
+                    args.putString("output", attributeMap.get("output"));
+                    sendEventToJS("RNCallKeepDidChangeAudioRoute", args);
                     break;
             }
         }
